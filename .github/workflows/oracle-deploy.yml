@@ -1,0 +1,185 @@
+name: oracle-deploy
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: oracle-deploy-gosubs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOSUBS_IMAGE_TAG: main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: GHCR owner (lowercase)
+        id: ghcr
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/gosubs:${{ env.GOSUBS_IMAGE_TAG }}
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/gosubs:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    runs-on: ubuntu-latest
+    environment: prd
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: GHCR owner (lowercase)
+        id: ghcr
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp container image in k3s manifest
+        run: |
+          set -euo pipefail
+          OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          IMG="ghcr.io/${OWNER}/gosubs:${{ github.sha }}"
+          sed -i "s|__GOSUBS_CONTAINER_IMAGE__|${IMG}|g" deploy/k8s/gosubs/deployment.yaml
+
+      - name: Pack k8s manifests
+        run: |
+          set -euo pipefail
+          test -d deploy/k8s/gosubs
+          tar czf gosubs-k8s.tgz -C deploy/k8s gosubs
+
+      - name: Copy k8s bundle to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ vars.OCI_VM_HOST || secrets.OCI_VM_HOST }}
+          username: ${{ vars.OCI_VM_USER || secrets.OCI_VM_USER }}
+          key: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
+          source: gosubs-k8s.tgz
+          target: /tmp/
+
+      - name: Deploy GoSubs on Oracle VM
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          OCI_DEPLOY_ROOT: ${{ vars.OCI_DEPLOY_ROOT || secrets.OCI_DEPLOY_ROOT }}
+          GOSUBS_GHCR_OWNER: ${{ steps.ghcr.outputs.owner }}
+          GOSUBS_IMAGE_TAG: main
+          GOSUBS_ADMIN_API_KEY: ${{ vars.GOSUBS_ADMIN_API_KEY || secrets.GOSUBS_ADMIN_API_KEY }}
+          GOSUBS_TOKEN_SECRET: ${{ vars.GOSUBS_TOKEN_SECRET || secrets.GOSUBS_TOKEN_SECRET }}
+          GOSUBS_WYZIE_API_KEY: ${{ vars.GOSUBS_WYZIE_API_KEY || secrets.GOSUBS_WYZIE_API_KEY }}
+          GOSUBS_WYZIE_BASE_URL: ${{ vars.GOSUBS_WYZIE_BASE_URL || secrets.GOSUBS_WYZIE_BASE_URL }}
+          GOSUBS_WYZIE_SOURCE: ${{ vars.GOSUBS_WYZIE_SOURCE || secrets.GOSUBS_WYZIE_SOURCE }}
+          GOSUBS_GOAI_BASE_URL: ${{ vars.GOSUBS_GOAI_BASE_URL || secrets.GOSUBS_GOAI_BASE_URL }}
+          GOSUBS_GOAI_API_KEY: ${{ vars.GOSUBS_GOAI_API_KEY || secrets.GOSUBS_GOAI_API_KEY }}
+          GOSUBS_CACHE_DIR: ${{ vars.GOSUBS_CACHE_DIR || secrets.GOSUBS_CACHE_DIR }}
+          GOSUBS_CACHE_TTL: ${{ vars.GOSUBS_CACHE_TTL || secrets.GOSUBS_CACHE_TTL }}
+          GOSUBS_MAX_BATCH_CHARS: ${{ vars.GOSUBS_MAX_BATCH_CHARS || secrets.GOSUBS_MAX_BATCH_CHARS }}
+          GOSUBS_HTTP_ADDR: ${{ vars.GOSUBS_HTTP_ADDR || secrets.GOSUBS_HTTP_ADDR }}
+          PORT: ${{ vars.PORT || secrets.PORT }}
+          GIN_MODE: ${{ vars.GIN_MODE || secrets.GIN_MODE }}
+        with:
+          host: ${{ vars.OCI_VM_HOST || secrets.OCI_VM_HOST }}
+          username: ${{ vars.OCI_VM_USER || secrets.OCI_VM_USER }}
+          key: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
+          command_timeout: 30m
+          envs: OCI_DEPLOY_ROOT,GOSUBS_GHCR_OWNER,GOSUBS_IMAGE_TAG,GOSUBS_ADMIN_API_KEY,GOSUBS_TOKEN_SECRET,GOSUBS_WYZIE_API_KEY,GOSUBS_WYZIE_BASE_URL,GOSUBS_WYZIE_SOURCE,GOSUBS_GOAI_BASE_URL,GOSUBS_GOAI_API_KEY,GOSUBS_CACHE_DIR,GOSUBS_CACHE_TTL,GOSUBS_MAX_BATCH_CHARS,GOSUBS_HTTP_ADDR,PORT,GIN_MODE
+          script_stop: true
+          script: |
+            set -euo pipefail
+            ROOT="${OCI_DEPLOY_ROOT:-/opt/go}"
+            ORACLE_DIR="${ROOT}/deploy/oracle"
+            DEPLOY_ENV="${ORACLE_DIR}/.env.gosubs.deploy"
+            mkdir -p "${ORACLE_DIR}"
+            K8S_TAR="${GOSUBS_K8S_TARBALL:-/tmp/gosubs-k8s.tgz}"
+            if [ ! -f "${K8S_TAR}" ]; then
+              echo "Falta ${K8S_TAR}." >&2
+              exit 1
+            fi
+            mkdir -p "${ROOT}/deploy/k8s"
+            tar xzf "${K8S_TAR}" -C "${ROOT}/deploy/k8s"
+            rm -f "${K8S_TAR}"
+            K8S_DIR="${ROOT}/deploy/k8s/gosubs"
+            command -v kubectl >/dev/null 2>&1 || { echo "kubectl não está no PATH nesta VM." >&2; exit 1; }
+            if [ -z "${KUBECONFIG:-}" ]; then
+              for f in /etc/rancher/k3s/k3s.yaml "${HOME}/.kube/config"; do
+                if [ -r "$f" ]; then
+                  export KUBECONFIG="$f"
+                  break
+                fi
+              done
+            fi
+            if [ -z "${KUBECONFIG:-}" ] || ! kubectl cluster-info --request-timeout=10s >/dev/null 2>&1; then
+              echo "kubectl sem API do k3s." >&2
+              exit 1
+            fi
+            umask 077
+            : > "${DEPLOY_ENV}"
+            write_kv() {
+              _k="$1"
+              _v="$2"
+              [ -n "${_v}" ] || return 0
+              printf '%s=%s\n' "${_k}" "${_v}" >> "${DEPLOY_ENV}"
+            }
+            write_kv GOSUBS_ADMIN_API_KEY "${GOSUBS_ADMIN_API_KEY:-}"
+            write_kv GOSUBS_TOKEN_SECRET "${GOSUBS_TOKEN_SECRET:-}"
+            write_kv GOSUBS_WYZIE_API_KEY "${GOSUBS_WYZIE_API_KEY:-}"
+            write_kv GOSUBS_WYZIE_BASE_URL "${GOSUBS_WYZIE_BASE_URL:-}"
+            write_kv GOSUBS_WYZIE_SOURCE "${GOSUBS_WYZIE_SOURCE:-}"
+            write_kv GOSUBS_GOAI_BASE_URL "${GOSUBS_GOAI_BASE_URL:-}"
+            write_kv GOSUBS_GOAI_API_KEY "${GOSUBS_GOAI_API_KEY:-}"
+            write_kv GOSUBS_CACHE_DIR "${GOSUBS_CACHE_DIR:-}"
+            write_kv GOSUBS_CACHE_TTL "${GOSUBS_CACHE_TTL:-}"
+            write_kv GOSUBS_MAX_BATCH_CHARS "${GOSUBS_MAX_BATCH_CHARS:-}"
+            write_kv GOSUBS_HTTP_ADDR "${GOSUBS_HTTP_ADDR:-}"
+            write_kv PORT "${PORT:-}"
+            write_kv GIN_MODE "${GIN_MODE:-}"
+            chmod 600 "${DEPLOY_ENV}" || true
+            kubectl apply -f "${K8S_DIR}/namespace.yaml"
+            kubectl -n gosubs create secret generic gosubs-env \
+              --from-env-file="${DEPLOY_ENV}" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            kubectl apply -k "${K8S_DIR}"
+            CONFIG_HASH=$(sha256sum "${DEPLOY_ENV}" | awk '{print $1}')
+            kubectl -n gosubs patch deployment gosubs --type strategic -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"gosubs.github/config-sha\":\"${CONFIG_HASH}\"}}}}}"
+            kubectl -n gosubs rollout status deployment/gosubs --timeout=900s

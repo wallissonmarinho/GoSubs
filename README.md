@@ -39,6 +39,16 @@ Addon de legendas para Stremio com foco em `pt-BR`, traduzindo sob demanda via `
 - `GOSUBS_MAX_BATCH_CHARS` (default `4000`)
 - `GOSUBS_HTTP_ADDR` ou `PORT`
 
+## Deploy
+
+- hostname publico: `gosubs.duckdns.org`
+- namespace k3s: `gosubs`
+- o workflow usa o mesmo padrao de `k3s` dos outros projetos:
+  - build/push GHCR
+  - copia `deploy/k8s/gosubs`
+  - recria o Secret `gosubs-env`
+  - `kubectl apply -k`
+
 ## Run
 
 ```bash
